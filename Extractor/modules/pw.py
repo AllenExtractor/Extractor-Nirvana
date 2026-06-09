@@ -146,17 +146,17 @@ async def pw_login(app, message):
             return
 
         with open(filename, 'w') as f:
-            for subject in subjects:
+    for subject in subjects:
     if isinstance(subject, str):
         si = subject
         sn = subject
-    else:
+      else:
         si = subject.get("_id")
         sn = subject.get("subject")
-                await app.send_message(
-                    chat_id=message.chat.id, 
-                    text=f"📘 **Processing Subject:** **{sn}**... ⏳"
-                )
+      await app.send_message(
+        chat_id=message.chat.id, 
+        text=f"📘 **Processing Subject:** **{sn}**... ⏳"
+      )
                 
                 for page in range(1, 12):
                     content_response = requests.get(
