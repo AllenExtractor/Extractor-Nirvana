@@ -17,6 +17,9 @@ import aiofiles
 txt_dump = CHANNEL_ID
 appname = "Physics Wallah"
 
+# Semaphore: max 3 concurrent schedule-detail requests to avoid 429
+_schedule_detail_semaphore = asyncio.Semaphore(3)
+
 async def sanitize_bname(bname, max_length=50):
     bname = re.sub(r'[\\/:*?"<>|\t\n\r]+', '', bname).strip()
     if len(bname) > max_length:
@@ -24,20 +27,32 @@ async def sanitize_bname(bname, max_length=50):
     return bname
 
 async def fetch_pwwp_data(session: aiohttp.ClientSession, url: str, headers: dict = None, params: dict = None, data: dict = None, method: str = 'GET') -> any:
-    max_retries = 3
+    max_retries = 5
     for attempt in range(max_retries):
         try:
             async with session.request(method, url, headers=headers, params=params, json=data) as response:
-                # 404 means endpoint doesn't exist — no point retrying
+                # 404 — endpoint doesn't exist, no point retrying
                 if response.status == 404:
-                    logging.warning(f"404 Not Found: {url} — skipping retries")
+                    logging.warning(f"404 Not Found: {url} — skipping")
                     return None
+                # 429 — rate limited, respect Retry-After header
+                if response.status == 429:
+                    retry_after = int(response.headers.get("Retry-After", 5))
+                    retry_after = min(retry_after, 30)  # cap at 30s
+                    logging.warning(f"429 Rate Limited: {url} — waiting {retry_after}s (attempt {attempt+1})")
+                    await asyncio.sleep(retry_after)
+                    continue
                 response.raise_for_status()
                 return await response.json()
         except aiohttp.ClientResponseError as e:
             if e.status == 404:
-                logging.warning(f"404 Not Found: {url} — skipping retries")
+                logging.warning(f"404 Not Found: {url} — skipping")
                 return None
+            if e.status == 429:
+                wait = min(5 * (attempt + 1), 30)
+                logging.warning(f"429 Rate Limited: {url} — waiting {wait}s (attempt {attempt+1})")
+                await asyncio.sleep(wait)
+                continue
             logging.error(f"Attempt {attempt + 1} failed: aiohttp error fetching {url}: {e}")
         except aiohttp.ClientError as e:
             logging.error(f"Attempt {attempt + 1} failed: aiohttp error fetching {url}: {e}")
@@ -180,120 +195,87 @@ async def fetch_today_schedule(session: aiohttp.ClientSession, batch_id: str, ta
     """Fetch schedule for a specific date from PW API using correct endpoints"""
     all_schedules = []
 
-    # Parse target date
     try:
         dt = datetime.strptime(target_date, "%Y-%m-%d")
-        # PW API uses epoch milliseconds for date filtering
         epoch_ms = int(calendar.timegm(dt.timetuple())) * 1000
-        # Next day epoch for range
         next_dt = dt + timedelta(days=1)
         epoch_ms_end = int(calendar.timegm(next_dt.timetuple())) * 1000
     except ValueError:
         logging.error(f"Invalid date format: {target_date}")
         return []
 
-    # PW actual working endpoints for batch content/schedule - try in order
+    # PW real working endpoints tried in order
     endpoint_variants = [
-        # v3 batch content endpoint (most common working one)
-        {
-            "url": f"https://api.penpencil.co/v3/batches/{batch_id}/batch-contents",
-            "params_list": [
-                {"page": 1, "startDate": epoch_ms, "endDate": epoch_ms_end},
-                {"page": 1, "startDate": target_date, "endDate": target_date},
-            ]
-        },
-        # v2 batch content endpoint
-        {
-            "url": f"https://api.penpencil.co/v2/batches/{batch_id}/batch-contents",
-            "params_list": [
-                {"page": 1, "startDate": epoch_ms, "endDate": epoch_ms_end},
-                {"page": 1, "startDate": target_date, "endDate": target_date},
-            ]
-        },
-        # v3 contents endpoint
-        {
-            "url": f"https://api.penpencil.co/v3/batches/{batch_id}/contents",
-            "params_list": [
-                {"page": 1, "startDate": epoch_ms, "endDate": epoch_ms_end},
-                {"page": 1, "date": target_date},
-            ]
-        },
-        # v2 contents endpoint
-        {
-            "url": f"https://api.penpencil.co/v2/batches/{batch_id}/contents",
-            "params_list": [
-                {"page": 1, "startDate": epoch_ms, "endDate": epoch_ms_end},
-                {"page": 1, "startDate": target_date, "endDate": target_date},
-            ]
-        },
+        (f"https://api.penpencil.co/v3/batches/{batch_id}/batch-contents",
+            [{"page": 1, "startDate": epoch_ms, "endDate": epoch_ms_end},
+             {"page": 1, "startDate": target_date, "endDate": target_date}]),
+        (f"https://api.penpencil.co/v2/batches/{batch_id}/batch-contents",
+            [{"page": 1, "startDate": epoch_ms, "endDate": epoch_ms_end},
+             {"page": 1, "startDate": target_date, "endDate": target_date}]),
+        (f"https://api.penpencil.co/v3/batches/{batch_id}/contents",
+            [{"page": 1, "startDate": epoch_ms, "endDate": epoch_ms_end},
+             {"page": 1, "date": target_date}]),
+        (f"https://api.penpencil.co/v2/batches/{batch_id}/contents",
+            [{"page": 1, "startDate": epoch_ms, "endDate": epoch_ms_end},
+             {"page": 1, "startDate": target_date, "endDate": target_date}]),
     ]
 
-    for endpoint in endpoint_variants:
-        url = endpoint["url"]
-        for base_params in endpoint["params_list"]:
+    for url, params_list in endpoint_variants:
+        for base_params in params_list:
             page = 1
-            trial_schedules = []
-            success = False
+            trial = []
+            got_success = False
             while True:
                 params = dict(base_params)
                 params["page"] = page
                 data = await fetch_pwwp_data(session, url, headers=headers, params=params)
                 if data is None:
-                    # 404 or error - this endpoint doesn't exist, skip all its param variants
-                    break
+                    break  # 404 or hard error — skip this endpoint entirely
                 if data.get("success") and data.get("data"):
-                    schedules = data["data"]
-                    if not schedules:
+                    items = data["data"]
+                    if not items:
                         break
-                    for item in schedules:
+                    for item in items:
                         item["_page"] = page
-                        trial_schedules.append(item)
-                    success = True
+                        trial.append(item)
+                    got_success = True
                     page += 1
                 else:
                     break
-
-            if trial_schedules:
+            if trial:
                 # Filter to only items matching target_date if date field present
-                filtered = []
-                for item in trial_schedules:
-                    item_date_raw = (
-                        item.get("date") or
-                        item.get("startTime") or
-                        item.get("scheduleDate") or
-                        item.get("createdAt") or
-                        ""
+                filtered = [
+                    item for item in trial
+                    if target_date in str(
+                        item.get("date") or item.get("startTime") or
+                        item.get("scheduleDate") or item.get("createdAt") or ""
+                    ) or not (
+                        item.get("date") or item.get("startTime") or
+                        item.get("scheduleDate") or item.get("createdAt")
                     )
-                    item_date_str = str(item_date_raw)
-                    if target_date in item_date_str or not item_date_raw:
-                        filtered.append(item)
-                all_schedules = filtered if filtered else trial_schedules
-                logging.info(f"fetch_today_schedule: success via {url} | got {len(all_schedules)} items")
+                ]
+                all_schedules = filtered if filtered else trial
+                logging.info(f"fetch_today_schedule: {len(all_schedules)} items via {url}")
                 return all_schedules
-            elif success:
-                # Endpoint worked but returned empty - no classes this date
-                logging.info(f"fetch_today_schedule: {url} returned empty for {target_date}")
+            elif got_success:
+                logging.info(f"fetch_today_schedule: {url} worked but empty for {target_date}")
                 return []
 
-    # All REST endpoints failed — fallback: iterate all subjects and fetch contents per subject
-    logging.warning(f"fetch_today_schedule: all direct endpoints failed, using subject-content fallback")
+    # Last resort: fetch per-subject contents and filter client-side
+    logging.warning("fetch_today_schedule: all endpoints failed, trying subject-content fallback")
     try:
-        batch_url = f"https://api.penpencil.co/v3/batches/{batch_id}/details"
-        batch_details = await fetch_pwwp_data(session, batch_url, headers=headers)
-        if batch_details and batch_details.get("success"):
-            subjects = batch_details.get("data", {}).get("subjects", [])
-            for subj in subjects:
+        bd = await fetch_pwwp_data(
+            session, f"https://api.penpencil.co/v3/batches/{batch_id}/details", headers=headers
+        )
+        if bd and bd.get("success"):
+            for subj in bd.get("data", {}).get("subjects", []):
                 subj_id = subj.get("_id")
-                for content_type in ["videos", "notes", "DppVideos", "DppNotes"]:
+                for ct in ["videos", "notes", "DppVideos", "DppNotes"]:
                     page = 1
                     while True:
+                        params = {"contentType": ct, "page": page,
+                                  "startDate": epoch_ms, "endDate": epoch_ms_end}
                         url = f"https://api.penpencil.co/v2/batches/{batch_id}/subject/{subj_id}/contents"
-                        params = {
-                            "contentType": content_type,
-                            "page": page,
-                            "startDate": epoch_ms,
-                            "endDate": epoch_ms_end,
-                        }
                         data = await fetch_pwwp_data(session, url, headers=headers, params=params)
                         if data and data.get("success") and data.get("data"):
                             items = data["data"]
@@ -301,22 +283,25 @@ async def fetch_today_schedule(session: aiohttp.ClientSession, batch_id: str, ta
                                 break
                             for item in items:
                                 item["_subject_id"] = subj_id
-                                item["_content_type"] = content_type
-                                item["_page"] = page
+                                item["_content_type"] = ct
                                 all_schedules.append(item)
                             page += 1
                         else:
                             break
     except Exception as e:
-        logging.error(f"fetch_today_schedule subject-fallback error: {e}")
+        logging.error(f"fetch_today_schedule fallback error: {e}")
 
-    logging.info(f"fetch_today_schedule fallback: got {len(all_schedules)} items")
+    logging.info(f"fetch_today_schedule fallback: {len(all_schedules)} items")
     return all_schedules
 
 async def fetch_schedule_details(session: aiohttp.ClientSession, batch_id: str, subject_id: str, schedule_id: str, headers: dict):
-    """Fetch detailed content for a schedule item"""
-    url = f"https://api.penpencil.co/v1/batches/{batch_id}/subject/{subject_id}/schedule/{schedule_id}/schedule-details"
-    return await fetch_pwwp_data(session, url, headers=headers)
+    """Fetch detailed content for a schedule item — rate-limited via semaphore"""
+    async with _schedule_detail_semaphore:
+        url = f"https://api.penpencil.co/v1/batches/{batch_id}/subject/{subject_id}/schedule/{schedule_id}/schedule-details"
+        result = await fetch_pwwp_data(session, url, headers=headers)
+        # Small delay after each request to avoid burst 429
+        await asyncio.sleep(0.4)
+        return result
 
 async def process_today_class(session: aiohttp.ClientSession, selected_batch_id: str, selected_batch_name: str, target_date: str, headers: dict, bot_link: str):
     """Process Today's Class extraction - fetch only scheduled content for target date"""
@@ -357,7 +342,7 @@ async def process_today_class(session: aiohttp.ClientSession, selected_batch_id:
     file_path_base = f"today_{target_date}_{clean_batch_name}"
 
     for schedule_item in schedules:
-        # Robust subject_id extraction
+        # Robust subject_id extraction — handles list, dict, or string
         raw_subject = schedule_item.get("subject", "")
         if isinstance(raw_subject, list):
             first = raw_subject[0] if raw_subject else ""
@@ -366,7 +351,6 @@ async def process_today_class(session: aiohttp.ClientSession, selected_batch_id:
             subject_id = raw_subject.get("_id", "")
         else:
             subject_id = str(raw_subject) if raw_subject else ""
-        # Fallback: subject-content path sets _subject_id directly
         if not subject_id:
             subject_id = schedule_item.get("_subject_id", "")
 
@@ -376,7 +360,6 @@ async def process_today_class(session: aiohttp.ClientSession, selected_batch_id:
         end_time = schedule_item.get("endTime", schedule_item.get("endDate", ""))
         content_type_tag = schedule_item.get("contentType", schedule_item.get("_content_type", schedule_item.get("type", "unknown")))
 
-        # Subject name from map or from schedule item itself
         subject_name = subject_map.get(subject_id, {}).get("name", "")
         if not subject_name:
             raw_sub = schedule_item.get("subject", {})
@@ -384,7 +367,7 @@ async def process_today_class(session: aiohttp.ClientSession, selected_batch_id:
                 subject_name = raw_sub.get("subject", raw_sub.get("name", ""))
             if not subject_name:
                 subject_name = schedule_item.get("subjectName", "Unknown Subject")
-            subject_name = subject_name.replace("/", "-") or "Unknown Subject"
+            subject_name = (subject_name or "Unknown Subject").replace("/", "-")
 
         if subject_name not in structured_data:
             structured_data[subject_name] = []
