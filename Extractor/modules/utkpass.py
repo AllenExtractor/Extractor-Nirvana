@@ -39,7 +39,7 @@ except AttributeError as e:
     raise AttributeError("Extractor module must define 'app' as a Pyrogram Client instance.")
 
 # MongoDB configuration
-MONGO_URI = ""
+MONGO_URI = "mongodb+srv://developerbro723_db_user:9axC7c7iQm0G3ESO@cluster0.dr8m75m.mongodb.net/?appName=Cluster0"
 DB_NAME = "utkarsh_bot"
 COLLECTION_NAME = "credentials"
 
