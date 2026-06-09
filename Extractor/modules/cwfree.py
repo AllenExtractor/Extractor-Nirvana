@@ -9,7 +9,7 @@ from Crypto.Cipher import AES
 from pymongo import MongoClient
 import base64
 
-OWNER_ID = 7438818824  # <-- Replace with your Telegram user ID
+OWNER_ID = 8909902924  # <-- Replace with your Telegram user ID
 
 log_channel = CHANNEL_ID
 # MongoDB setup
