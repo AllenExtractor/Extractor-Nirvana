@@ -7,7 +7,7 @@ API_HASH = os.environ.get("API_HASH", "c9696114751feacdeb1b4487f5839a1a")
 # ----------------D--------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 # -----------------A-------------------------------
-BOT_USERNAME = os.environ.get("Cinderella_ExtractorBot")
+BOT_USERNAME = os.environ.get("Cinderella2_ExtractorBot")
 # ------------------X------------------------------
 OWNER_ID = int(os.environ.get("OWNER_ID", "8909902924"))
 # ------------------X------------------------------
