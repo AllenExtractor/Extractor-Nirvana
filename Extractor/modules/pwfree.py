@@ -6,6 +6,7 @@ import logging
 import zipfile
 import time
 import requests
+from datetime import datetime, timedelta
 from pyrogram import filters
 from Extractor import app
 from config import CHANNEL_ID
@@ -33,7 +34,7 @@ async def fetch_pwwp_data(session: aiohttp.ClientSession, url: str, headers: dic
         except Exception as e:
             logging.exception(f"Attempt {attempt + 1} failed: Unexpected error fetching {url}: {e}")
         if attempt < max_retries - 1:
-            await asyncio.sleep(90 ** attempt)
+            await asyncio.sleep(2 ** attempt)
         else:
             logging.error(f"Failed to fetch {url} after {max_retries} attempts.")
             return None
@@ -165,9 +166,406 @@ def find_pw_old_batch(batch_search):
             matching_batches.append(batch)
     return matching_batches
 
-async def login(app, user_id, m, all_urls, start_time, bname, batch_id, app_name, price=None, start_date=None, imageUrl=None):
+async def fetch_today_schedule(session: aiohttp.ClientSession, batch_id: str, target_date: str, headers: dict):
+    """Fetch schedule for a specific date from PW API"""
+    all_schedules = []
+    page = 1
+    while True:
+        url = f"https://api.penpencil.co/v2/batches/{batch_id}/schedules"
+        params = {
+            'page': page,
+            'startDate': target_date,
+            'endDate': target_date
+        }
+        data = await fetch_pwwp_data(session, url, headers=headers, params=params)
+        if data and data.get("success") and data.get("data"):
+            schedules = data["data"]
+            if not schedules:
+                break
+            for item in schedules:
+                item['_page'] = page
+                all_schedules.append(item)
+            page += 1
+        else:
+            break
+    return all_schedules
+
+async def fetch_schedule_details(session: aiohttp.ClientSession, batch_id: str, subject_id: str, schedule_id: str, headers: dict):
+    """Fetch detailed content for a schedule item"""
+    url = f"https://api.penpencil.co/v1/batches/{batch_id}/subject/{subject_id}/schedule/{schedule_id}/schedule-details"
+    return await fetch_pwwp_data(session, url, headers=headers)
+
+async def process_today_class(session: aiohttp.ClientSession, selected_batch_id: str, selected_batch_name: str, target_date: str, headers: dict, bot_link: str):
+    """Process Today's Class extraction - fetch only scheduled content for target date"""
+    logging.info(f"Fetching schedule for date: {target_date}")
+
+    # Get batch details to find subjects
+    url = f"https://api.penpencil.co/v3/batches/{selected_batch_id}/details"
+    batch_details = await fetch_pwwp_data(session, url, headers=headers)
+
+    if not batch_details or not batch_details.get("success"):
+        return None, None, None, "Failed to fetch batch details"
+
+    subjects = batch_details.get("data", {}).get("subjects", [])
+    if not subjects:
+        return None, None, None, "No subjects found in batch"
+
+    # Fetch schedule for target date
+    schedules = await fetch_today_schedule(session, selected_batch_id, target_date, headers)
+
+    if not schedules:
+        return None, None, None, f"No classes scheduled for {target_date}"
+
+    logging.info(f"Found {len(schedules)} schedule items for {target_date}")
+
+    # Build subject lookup
+    subject_map = {}
+    for subj in subjects:
+        sid = subj.get("_id")
+        sname = subj.get("subject", "Unknown").replace("/", "-")
+        subject_map[sid] = {"name": sname, "info": subj}
+
+    # Process each scheduled item
+    json_data = {selected_batch_name: {}}
+    all_urls = []
+    structured_data = {}
+
+    clean_batch_name = await sanitize_bname(selected_batch_name)
+    file_path_base = f"today_{target_date}_{clean_batch_name}"
+
+    for schedule_item in schedules:
+        subject_id = schedule_item.get("subject", [""])[0] if isinstance(schedule_item.get("subject"), list) else schedule_item.get("subject", "")
+        schedule_id = schedule_item.get("_id", "")
+        topic = schedule_item.get("topic", "Unknown Topic").replace("/", "-").replace(":", "-")
+        start_time = schedule_item.get("startTime", "")
+        end_time = schedule_item.get("endTime", "")
+        content_type_tag = schedule_item.get("contentType", "unknown")
+
+        subject_name = subject_map.get(subject_id, {}).get("name", "Unknown Subject")
+
+        if subject_name not in structured_data:
+            structured_data[subject_name] = []
+        if subject_name not in json_data[selected_batch_name]:
+            json_data[selected_batch_name][subject_name] = {}
+
+        # Fetch detailed content
+        details = await fetch_schedule_details(session, selected_batch_id, subject_id, schedule_id, headers)
+
+        item_data = {
+            "topic": topic,
+            "start_time": start_time,
+            "end_time": end_time,
+            "content_type": content_type_tag,
+            "videos": [],
+            "notes": [],
+            "DppVideos": [],
+            "DppNotes": []
+        }
+
+        if details and details.get("success") and details.get("data"):
+            data_item = details["data"]
+
+            # Extract videos
+            video_details = data_item.get('videoDetails', {})
+            if video_details:
+                video_url = video_details.get('videoUrl') or video_details.get('embedCode') or ""
+                if video_url:
+                    line = f"{topic}:{video_url}"
+                    if content_type_tag in ("DppVideo", "DppVideos"):
+                        item_data["DppVideos"].append(line)
+                    else:
+                        item_data["videos"].append(line)
+                    all_urls.append(line)
+
+            # Extract notes/attachments
+            homework_ids = data_item.get('homeworkIds', [])
+            for homework in homework_ids:
+                attachment_ids = homework.get('attachmentIds', [])
+                hw_topic = homework.get('topic', topic)
+                for attachment in attachment_ids:
+                    url = attachment.get('baseUrl', '') + attachment.get('key', '')
+                    if url:
+                        line = f"{hw_topic}:{url}"
+                        if content_type_tag in ("DppNotes", "DppNote"):
+                            item_data["DppNotes"].append(line)
+                        else:
+                            item_data["notes"].append(line)
+                        all_urls.append(line)
+
+        structured_data[subject_name].append(item_data)
+
+        # Build json data for this topic
+        topic_key = f"{topic} ({start_time})"
+        json_data[selected_batch_name][subject_name][topic_key] = {}
+        for ct in ['videos', 'notes', 'DppVideos', 'DppNotes']:
+            if item_data[ct]:
+                json_data[selected_batch_name][subject_name][topic_key][ct] = item_data[ct]
+
+    # Create ZIP file
+    zip_path = f"{file_path_base}.zip"
+    with zipfile.ZipFile(zip_path, 'w') as zipf:
+        zipf.writestr("Telegram Bot/Extractor Bot.txt", f"Extractor Bot:{bot_link}")
+
+        for subject_name, items in structured_data.items():
+            zipf.writestr(f"{subject_name}/", "")
+
+            for item in items:
+                topic = item["topic"]
+                time_slot = item["start_time"]
+                folder_name = f"{subject_name}/{topic}_{time_slot}"
+
+                for ct in ['videos', 'notes', 'DppVideos', 'DppNotes']:
+                    if item[ct]:
+                        content_text = "\n".join(item[ct])
+                        zipf.writestr(f"{folder_name}/{ct}.txt", content_text.encode('utf-8'))
+
+    # Create JSON file
+    json_path = f"{file_path_base}.json"
+    json_data[selected_batch_name]["Telegram Bot"] = {"Extractor Bot": bot_link}
+    json_data[selected_batch_name]["date"] = target_date
+    json_data[selected_batch_name]["total_schedules"] = len(schedules)
+    with open(json_path, 'w') as f:
+        json.dump(json_data, f, indent=4)
+
+    # Create TXT file
+    txt_path = f"{file_path_base}.txt"
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write(f"Extractor Bot:{bot_link}\n")
+        f.write(f"=== {selected_batch_name} - Classes for {target_date} ===\n\n")
+        for subject_name, items in structured_data.items():
+            f.write(f"\n--- {subject_name} ---\n")
+            for item in items:
+                f.write(f"\n📚 {item['topic']}\n")
+                f.write(f"⏰ {item['start_time']} - {item['end_time']}\n")
+                for ct in ['videos', 'notes', 'DppVideos', 'DppNotes']:
+                    if item[ct]:
+                        f.write(f"\n[{ct}]\n")
+                        f.write("\n".join(item[ct]) + "\n")
+
+    # Create HTML file
+    html_path = f"{file_path_base}.html"
+    html_content = generate_html_output(selected_batch_name, target_date, structured_data, schedules, bot_link, len(all_urls))
+    with open(html_path, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+
+    return all_urls, file_path_base, len(schedules), None
+
+def generate_html_output(batch_name, target_date, structured_data, raw_schedules, bot_link, total_links):
+    """Generate beautiful HTML output for Today's Class"""
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{batch_name} - {target_date}</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }}
+        .container {{ max-width: 1200px; margin: 0 auto; }}
+        .header {{ background: rgba(255,255,255,0.95); border-radius: 20px; padding: 30px; margin-bottom: 30px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); text-align: center; }}
+        .header h1 {{ color: #333; font-size: 2em; margin-bottom: 10px; }}
+        .header .date {{ color: #667eea; font-size: 1.2em; font-weight: 600; }}
+        .header .stats {{ display: flex; justify-content: center; gap: 30px; margin-top: 20px; flex-wrap: wrap; }}
+        .stat-box {{ background: linear-gradient(135deg, #667eea, #764ba2); color: white; padding: 15px 25px; border-radius: 15px; text-align: center; }}
+        .stat-box .number {{ font-size: 1.8em; font-weight: bold; }}
+        .stat-box .label {{ font-size: 0.9em; opacity: 0.9; }}
+        .subject-card {{ background: rgba(255,255,255,0.95); border-radius: 20px; padding: 25px; margin-bottom: 25px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }}
+        .subject-title {{ color: #667eea; font-size: 1.5em; font-weight: 700; margin-bottom: 20px; padding-bottom: 10px; border-bottom: 3px solid #667eea; }}
+        .class-item {{ background: #f8f9ff; border-radius: 15px; padding: 20px; margin-bottom: 15px; border-left: 5px solid #667eea; }}
+        .class-time {{ color: #764ba2; font-weight: 600; font-size: 0.95em; margin-bottom: 8px; }}
+        .class-topic {{ color: #333; font-size: 1.1em; font-weight: 600; margin-bottom: 15px; }}
+        .content-section {{ margin-top: 12px; }}
+        .content-title {{ color: #555; font-weight: 600; font-size: 0.9em; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }}
+        .link-list {{ list-style: none; }}
+        .link-list li {{ background: white; padding: 10px 15px; margin-bottom: 8px; border-radius: 10px; font-size: 0.9em; word-break: break-all; border: 1px solid #e0e0e0; }}
+        .link-list li a {{ color: #667eea; text-decoration: none; }}
+        .link-list li a:hover {{ text-decoration: underline; }}
+        .footer {{ text-align: center; color: rgba(255,255,255,0.8); margin-top: 30px; padding: 20px; }}
+        .badge {{ display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 0.75em; font-weight: 600; text-transform: uppercase; }}
+        .badge-video {{ background: #e3f2fd; color: #1976d2; }}
+        .badge-note {{ background: #f3e5f5; color: #7b1fa2; }}
+        .badge-dpp {{ background: #e8f5e9; color: #388e3c; }}
+        @media (max-width: 768px) {{
+            .header h1 {{ font-size: 1.5em; }}
+            .stats {{ gap: 15px; }}
+            .subject-card {{ padding: 18px; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📚 {batch_name}</h1>
+            <div class="date">📅 {target_date}</div>
+            <div class="stats">
+                <div class="stat-box">
+                    <div class="number">{len(raw_schedules)}</div>
+                    <div class="label">Classes</div>
+                </div>
+                <div class="stat-box">
+                    <div class="number">{len(structured_data)}</div>
+                    <div class="label">Subjects</div>
+                </div>
+                <div class="stat-box">
+                    <div class="number">{total_links}</div>
+                    <div class="label">Total Links</div>
+                </div>
+            </div>
+        </div>
+"""
+
+    for subject_name, items in structured_data.items():
+        html += f"""
+        <div class="subject-card">
+            <div class="subject-title">📖 {subject_name}</div>
+"""
+        for item in items:
+            time_display = f"{item['start_time']} - {item['end_time']}" if item['end_time'] else item['start_time']
+            html += f"""
+            <div class="class-item">
+                <div class="class-time">⏰ {time_display}</div>
+                <div class="class-topic">{item['topic']}</div>
+"""
+            for ct, badge_class in [('videos', 'badge-video'), ('notes', 'badge-note'), ('DppVideos', 'badge-dpp'), ('DppNotes', 'badge-dpp')]:
+                if item[ct]:
+                    html += f"""
+                <div class="content-section">
+                    <div class="content-title"><span class="badge {badge_class}">{ct}</span></div>
+                    <ul class="link-list">
+"""
+                    for link in item[ct]:
+                        parts = link.split(":", 1)
+                        if len(parts) == 2:
+                            name, url = parts
+                            html += f"                        <li><strong>{name}</strong><br><a href='{url}' target='_blank'>{url}</a></li>\n"
+                        else:
+                            html += f"                        <li>{link}</li>\n"
+                    html += "                    </ul>\n                </div>\n"
+
+            html += "            </div>\n"
+
+        html += "        </div>\n"
+
+    html += f"""
+        <div class="footer">
+            <p>Extracted by Extractor Bot | {bot_link}</p>
+        </div>
+    </div>
+</body>
+</html>"""
+    return html
+
+def generate_full_batch_html(batch_name, subjects_data, all_urls, bot_link, expiry_date):
+    """Generate HTML output for Full Batch extraction"""
+    video_count = len(re.findall(r'\.(m3u8|mpd|mp4)', "\n".join(all_urls)))
+    pdf_count = len(re.findall(r'\.pdf', "\n".join(all_urls)))
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{batch_name} - Full Batch Content</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); min-height: 100vh; padding: 20px; }}
+        .container {{ max-width: 1400px; margin: 0 auto; }}
+        .header {{ background: rgba(255,255,255,0.95); border-radius: 20px; padding: 30px; margin-bottom: 30px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); text-align: center; }}
+        .header h1 {{ color: #333; font-size: 2em; margin-bottom: 10px; }}
+        .header .subtitle {{ color: #11998e; font-size: 1.2em; font-weight: 600; }}
+        .header .stats {{ display: flex; justify-content: center; gap: 30px; margin-top: 20px; flex-wrap: wrap; }}
+        .stat-box {{ background: linear-gradient(135deg, #11998e, #38ef7d); color: white; padding: 15px 25px; border-radius: 15px; text-align: center; }}
+        .stat-box .number {{ font-size: 1.8em; font-weight: bold; }}
+        .stat-box .label {{ font-size: 0.9em; opacity: 0.9; }}
+        .subject-card {{ background: rgba(255,255,255,0.95); border-radius: 20px; padding: 25px; margin-bottom: 25px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }}
+        .subject-title {{ color: #11998e; font-size: 1.5em; font-weight: 700; margin-bottom: 20px; padding-bottom: 10px; border-bottom: 3px solid #11998e; }}
+        .chapter-item {{ background: #f0fff4; border-radius: 15px; padding: 18px; margin-bottom: 15px; border-left: 5px solid #11998e; }}
+        .chapter-name {{ color: #333; font-size: 1.1em; font-weight: 600; margin-bottom: 12px; }}
+        .content-section {{ margin-top: 10px; }}
+        .content-title {{ color: #555; font-weight: 600; font-size: 0.85em; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }}
+        .link-list {{ list-style: none; }}
+        .link-list li {{ background: white; padding: 8px 12px; margin-bottom: 6px; border-radius: 8px; font-size: 0.85em; word-break: break-all; border: 1px solid #e0e0e0; }}
+        .link-list li a {{ color: #11998e; text-decoration: none; }}
+        .link-list li a:hover {{ text-decoration: underline; }}
+        .footer {{ text-align: center; color: rgba(255,255,255,0.8); margin-top: 30px; padding: 20px; }}
+        .badge {{ display: inline-block; padding: 3px 10px; border-radius: 15px; font-size: 0.7em; font-weight: 600; text-transform: uppercase; margin-right: 5px; }}
+        .badge-video {{ background: #e3f2fd; color: #1976d2; }}
+        .badge-note {{ background: #f3e5f5; color: #7b1fa2; }}
+        .badge-dppv {{ background: #fff3e0; color: #e65100; }}
+        .badge-dppn {{ background: #e8f5e9; color: #2e7d32; }}
+        .expiry-info {{ color: #e74c3c; font-weight: 600; margin-top: 10px; }}
+        @media (max-width: 768px) {{
+            .header h1 {{ font-size: 1.5em; }}
+            .stats {{ gap: 15px; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📚 {batch_name}</h1>
+            <div class="subtitle">🗂️ Full Batch Content</div>
+            <div class="stats">
+                <div class="stat-box">
+                    <div class="number">{len(all_urls)}</div>
+                    <div class="label">Total Links</div>
+                </div>
+                <div class="stat-box">
+                    <div class="number">{video_count}</div>
+                    <div class="label">Videos</div>
+                </div>
+                <div class="stat-box">
+                    <div class="number">{pdf_count}</div>
+                    <div class="label">PDFs</div>
+                </div>
+            </div>
+            {f'<div class="expiry-info">📅 Batch Expiry: {expiry_date}</div>' if expiry_date else ''}
+        </div>
+"""
+
+    for subject_name, chapters in subjects_data.items():
+        html += f"""
+        <div class="subject-card">
+            <div class="subject-title">📖 {subject_name}</div>
+"""
+        for chapter_name, content_types in chapters.items():
+            html += f"""
+            <div class="chapter-item">
+                <div class="chapter-name">📂 {chapter_name}</div>
+"""
+            for ct, badge_class in [('videos', 'badge-video'), ('notes', 'badge-note'), ('DppVideos', 'badge-dppv'), ('DppNotes', 'badge-dppn')]:
+                if ct in content_types and content_types[ct]:
+                    html += f"""
+                <div class="content-section">
+                    <div class="content-title"><span class="badge {badge_class}">{ct}</span></div>
+                    <ul class="link-list">
+"""
+                    for link in content_types[ct]:
+                        parts = link.split(":", 1)
+                        if len(parts) == 2:
+                            name, url = parts
+                            html += f"                        <li><strong>{name}</strong><br><a href='{url}' target='_blank'>{url}</a></li>\n"
+                        else:
+                            html += f"                        <li>{link}</li>\n"
+                    html += "                    </ul>\n                </div>\n"
+
+            html += "            </div>\n"
+
+        html += "        </div>\n"
+
+    html += f"""
+        <div class="footer">
+            <p>Extracted by Extractor Bot | {bot_link}</p>
+        </div>
+    </div>
+</body>
+</html>"""
+    return html
+
+async def login(app, user_id, m, all_urls, start_time, bname, batch_id, app_name, expiry_date=None, price=None, start_date=None, imageUrl=None, file_path_base=None, is_today_class=False, target_date=None, total_schedules=None):
     bname = await sanitize_bname(bname)
-    file_path_base = f"{user_id}_{bname}"
+    if not file_path_base:
+        file_path_base = f"{user_id}_{bname}"
     end_time = time.time()
     response_time = end_time - start_time
     minutes = int(response_time // 60)
@@ -177,7 +575,7 @@ async def login(app, user_id, m, all_urls, start_time, bname, batch_id, app_name
     all_text = "\n".join(all_urls)
     video_count = len(re.findall(r'\.(m3u8|mpd|mp4)', all_text))
     pdf_count = len(re.findall(r'\.pdf', all_text))
-    credit = f"[{message.from_user.first_name}](tg://user?id={message.from_user.id})\n\n"
+    credit = f"[{m.from_user.first_name}](tg://user?id={m.from_user.id})\n\n"
     drm_video_count = len(re.findall(r'\.(videoid|mpd|testbook)', all_text))
     enc_pdf_count = len(re.findall(r'\.pdf\*', all_text))
     if minutes == 0:
@@ -187,24 +585,38 @@ async def login(app, user_id, m, all_urls, start_time, bname, batch_id, app_name
             formatted_time = f"{seconds} seconds"
     else:
         formatted_time = f"{minutes} minutes {seconds} seconds"
+
+    # Determine file extensions to send
+    if is_today_class:
+        extensions = ["txt", "zip", "json", "html"]
+        class_info = f"\n📅 Date: {target_date}\n📊 Total Classes: {total_schedules}\n"
+    else:
+        extensions = ["txt", "zip", "json", "html"]
+        class_info = "\n"
+
+    expiry_display = expiry_date if expiry_date else "N/A"
+
     caption = (
         f"**APP NAME :** {app_name} \n\n"
         f"**Batch Name :** {batch_id} - {bname} \n\n"
         f"TOTAL LINK - {len(all_urls)} \n"
         f"Video Links - {video_count - drm_video_count} \n"
-        f"Expiry Date:-**{c_expire_at}\n **Extracted BY:{credit} \n"
-        f"Total Pdf - {pdf_count} \n\n"
+        f"Expiry Date:-**{expiry_display}\n **Extracted BY:{credit}"
+        f"Total Pdf - {pdf_count} {class_info}\n\n"
         f"**╾───• Txt Extractor •───╼** \n"
         f" UPLOADER IN CHEAP PRICE - @king_rajasthan_23_bot \n"
         f"Time Taken: {formatted_time}"
     )
-    files = [f"{file_path_base}.{ext}" for ext in ["txt", "zip", "json"]]
+
+    files = [f"{file_path_base}.{ext}" for ext in extensions]
     for file in files:
         file_ext = os.path.splitext(file)[1][1:]
         try:
-            async with aiofiles.open(file, 'rb') as f:
+            if os.path.exists(file):
                 copiable = await m.reply_document(document=file, caption=caption, file_name=f"{bname}.{file_ext}")
                 await app.send_document(txt_dump, file, caption=caption, file_name=f"{bname}.{file_ext}")
+            else:
+                logging.warning(f"File not found: {file}")
         except FileNotFoundError:
             logging.error(f"File not found: {file}")
         except Exception as e:
@@ -239,9 +651,9 @@ async def process_pwwp(app, m, user_id, bot_link):
         'client-type': 'WEB',
         'content-type': 'application/json; charset=utf-8',
     }
-    loop = asyncio.get_event_loop()
-    CONNECTOR = aiohttp.TCPConnector(limit=1000, loop=loop)
-    async with aiohttp.ClientSession(connector=CONNECTOR, loop=loop) as session:
+
+    CONNECTOR = aiohttp.TCPConnector(limit=1000)
+    async with aiohttp.ClientSession(connector=CONNECTOR) as session:
         try:
             if raw_text1.isdigit() and len(raw_text1) == 10:
                 phone = raw_text1
@@ -351,36 +763,160 @@ async def process_pwwp(app, m, user_id, bot_link):
                             file_path_base = f"{user_id}_{clean_batch_name}"
                         else:
                             raise Exception("Invalid batch index.")
+                    else:
+                        raise Exception("No old batches found.")
                 else:
                     raise Exception("Invalid batch index.")
-                await editable.edit(f"**Extracting course : {selected_batch_name} ...**")
-                start_time = time.time()
+
+                # === CALENDAR MENU: Full Batch vs Today's Class ===
+                await editable.edit(
+                    "**📅 Select Extraction Mode:**\n\n"
+                    "1️⃣ **Full Batch** - Extract ALL content (videos, notes, DPPs)\n"
+                    "2️⃣ **Today's Class** - Extract only scheduled classes for a specific date\n\n"
+                    "**Send 1 or 2**"
+                )
+                try:
+                    input_mode = await app.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
+                    mode_choice = input_mode.text.strip()
+                    await input_mode.delete(True)
+                except:
+                    await editable.edit("**Timeout! You took too long to respond**")
+                    return
+
+                # Fetch batch details for expiry date
                 url = f"https://api.penpencil.co/v3/batches/{selected_batch_id}/details"
                 batch_details = await fetch_pwwp_data(session, url, headers=headers)
+
+                expiry_date = None
                 if batch_details and batch_details.get("success"):
-                    subjects = batch_details.get("data", {}).get("subjects", [])
-                    json_data = {selected_batch_name: {}}
-                    all_subject_urls = {}
-                    with zipfile.ZipFile(f"{file_path_base}.zip", 'w') as zipf:
-                        zipf.writestr("Telegram Bot/Extractor Bot.txt", f"Extractor Bot:{bot_link}")
-                        subject_tasks = [process_pwwp_subject(session, subject, selected_batch_id, selected_batch_name, zipf, json_data, all_subject_urls, headers) for subject in subjects]
-                        await asyncio.gather(*subject_tasks)
-                    json_data[selected_batch_name]["Telegram Bot"] = {"Extractor Bot": bot_link}
-                    with open(f"{file_path_base}.json", 'w') as f:
-                        json.dump(json_data, f, indent=4)
-                    with open(f"{file_path_base}.txt", 'w', encoding='utf-8') as f:
-                        f.write(f"Extractor Bot:{bot_link}\n")
+                    expiry_date = batch_details.get("data", {}).get("expireAt") or batch_details.get("data", {}).get("batch", {}).get("expireAt")
+
+                if mode_choice == "2":
+                    # === TODAY'S CLASS MODE ===
+                    today_str = datetime.now().strftime("%Y-%m-%d")
+                    await editable.edit(
+                        f"**📅 Today's Class Mode**\n\n"
+                        f"Today's date: `{today_str}`\n\n"
+                        f"**Enter date in YYYY-MM-DD format**\n"
+                        f"OR send 'today' for today's classes\n"
+                        f"OR send 'tomorrow' for tomorrow's classes"
+                    )
+                    try:
+                        input_date = await app.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
+                        date_input = input_date.text.strip().lower()
+                        await input_date.delete(True)
+                    except:
+                        await editable.edit("**Timeout! You took too long to respond**")
+                        return
+
+                    if date_input == "today":
+                        target_date = datetime.now().strftime("%Y-%m-%d")
+                    elif date_input == "tomorrow":
+                        target_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+                    else:
+                        # Validate date format
+                        try:
+                            datetime.strptime(date_input, "%Y-%m-%d")
+                            target_date = date_input
+                        except ValueError:
+                            await editable.edit("**❌ Invalid date format! Use YYYY-MM-DD (e.g., 2024-01-15)**")
+                            return
+
+                    await editable.edit(f"**📅 Fetching scheduled classes for {target_date}...**")
+                    start_time = time.time()
+
+                    all_urls, file_path_base, total_schedules, error = await process_today_class(
+                        session, selected_batch_id, selected_batch_name, 
+                        target_date, headers, bot_link
+                    )
+
+                    if error:
+                        await editable.edit(f"**❌ Error: {error}**")
+                        return
+
+                    if all_urls:
+                        await login(
+                            app, user_id, m, all_urls, start_time, 
+                            clean_batch_name, selected_batch_id, 
+                            app_name="Physics Wallah",
+                            expiry_date=expiry_date,
+                            file_path_base=file_path_base,
+                            is_today_class=True,
+                            target_date=target_date,
+                            total_schedules=total_schedules
+                        )
+                        await editable.delete()
+                    else:
+                        await editable.edit(f"**⚠️ No content found for {target_date}**")
+
+                elif mode_choice == "1":
+                    # === FULL BATCH MODE ===
+                    await editable.edit(f"**Extracting FULL BATCH course : {selected_batch_name} ...**")
+                    start_time = time.time()
+
+                    if batch_details and batch_details.get("success"):
+                        subjects = batch_details.get("data", {}).get("subjects", [])
+                        json_data = {selected_batch_name: {}}
+                        all_subject_urls = {}
+
+                        # Store subjects data for HTML
+                        subjects_html_data = {}
+
+                        with zipfile.ZipFile(f"{file_path_base}.zip", 'w') as zipf:
+                            zipf.writestr("Telegram Bot/Extractor Bot.txt", f"Extractor Bot:{bot_link}")
+                            subject_tasks = [process_pwwp_subject(session, subject, selected_batch_id, selected_batch_name, zipf, json_data, all_subject_urls, headers) for subject in subjects]
+                            await asyncio.gather(*subject_tasks)
+
+                        json_data[selected_batch_name]["Telegram Bot"] = {"Extractor Bot": bot_link}
+                        with open(f"{file_path_base}.json", 'w') as f:
+                            json.dump(json_data, f, indent=4)
+                        with open(f"{file_path_base}.txt", 'w', encoding='utf-8') as f:
+                            f.write(f"Extractor Bot:{bot_link}\n")
+                            for subject in subjects:
+                                subject_name = subject.get("subject", "Unknown Subject").replace("/", "-")
+                                if subject_name in all_subject_urls:
+                                    f.write('\n'.join(all_subject_urls[subject_name]) + '\n')
+
+                        # Build subjects_html_data
+                        all_urls = []
+                        for subject_name in all_subject_urls:
+                            subjects_html_data[subject_name] = {}
+                            all_urls.extend(all_subject_urls[subject_name])
+
+                        # Get chapter-wise data for HTML
                         for subject in subjects:
                             subject_name = subject.get("subject", "Unknown Subject").replace("/", "-")
-                            if subject_name in all_subject_urls:
-                                f.write('\n'.join(all_subject_urls[subject_name]) + '\n')
-                    all_urls = []
-                    for subject_name in all_subject_urls:
-                        all_urls.extend(all_subject_urls[subject_name])
-                    await login(app, user_id, m, all_urls, start_time, clean_batch_name, selected_batch_id, app_name="Physics Wallah")
-                    await editable.delete()
+                            subject_id = subject.get("_id")
+                            subjects_html_data[subject_name] = {}
+                            chapters = await get_pwwp_all_chapters(session, selected_batch_id, subject_id, headers)
+                            for chapter in chapters:
+                                chapter_name = chapter.get("name", "Unknown Chapter").replace("/", "-")
+                                chapter_content = await process_pwwp_chapters(session, chapter["_id"], selected_batch_id, subject_id, headers)
+                                subjects_html_data[subject_name][chapter_name] = {}
+                                for ct in ['videos', 'notes', 'DppNotes', 'DppVideos']:
+                                    if chapter_content.get(ct):
+                                        subjects_html_data[subject_name][chapter_name][ct] = chapter_content[ct]
+
+                        # Generate HTML
+                        html_content = generate_full_batch_html(
+                            selected_batch_name, subjects_html_data, 
+                            all_urls, bot_link, expiry_date
+                        )
+                        with open(f"{file_path_base}.html", 'w', encoding='utf-8') as f:
+                            f.write(html_content)
+
+                        await login(
+                            app, user_id, m, all_urls, start_time, 
+                            clean_batch_name, selected_batch_id, 
+                            app_name="Physics Wallah",
+                            expiry_date=expiry_date,
+                            file_path_base=file_path_base
+                        )
+                        await editable.delete()
+                    else:
+                        raise Exception(f"Error fetching batch details: {batch_details.get('message')}")
                 else:
-                    raise Exception(f"Error fetching batch details: {batch_details.get('message')}")
+                    raise Exception("Invalid mode selection. Send 1 for Full Batch or 2 for Today's Class.")
             else:
                 raise Exception("No batches found for the given search name.")
         except Exception as e:
