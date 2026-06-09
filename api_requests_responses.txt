@@ -1,0 +1,21 @@
+
+==================================================
+Timestamp: 2025-07-19 20:29:00
+Method: GET
+URL: https://api.khanglobalstudies.com/cms/user/v2/courses
+Headers: {
+  "Host": "api.khanglobalstudies.com",
+  "Content-Type": "application/json",
+  "Accept": "application/json",
+  "Origin": "https://www.khanglobalstudies.com",
+  "Referer": "https://www.khanglobalstudies.com/",
+  "Accept-Encoding": "gzip, deflate, br",
+  "Accept-Language": "en-US,en;q=0.9",
+  "authorization": "Bearer ",
+  "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+  "sec-ch-ua-platform": "\"Windows\""
+}
+Request Body: None
+Response Status: Unknown
+Response: None
+==================================================

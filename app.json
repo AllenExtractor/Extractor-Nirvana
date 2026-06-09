@@ -1,0 +1,71 @@
+{
+  "name": "NIRVANA",
+  "description": "🤖 A Feature-Rich Bot For Telegram",
+  "logo": "https://i.ibb.co/Mk47bDPV/0x1900-000000-80-0-0.jpg",
+  "keywords": [
+    "text-video",
+    "video-extract",
+    "pyrogram"
+  ],
+  "repository": "",
+  "success_url": "",
+  "stack": "container",
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "standard-2x"
+    }
+  },
+  "env": {
+    "API_ID": {
+      "description": "🔑 Enter Your API ID",
+      "value": "20369373",
+      "required": false
+    },
+    "API_HASH": {
+      "description": "🔒 Enter Your API Hash",
+      "value": "0d53cc7f978163fed3263be5cbb20ab0",
+      "required": false
+    },
+    "BOT_TOKEN": {
+      "description": "🤖 Enter Your Telegram Bot Token",
+      "value": "",
+      "required": true
+    },
+    "CREATOR_ID": {
+      "description": "🪪 Enter the Creator's ID (Optional)",
+      "value": "5680454765",
+      "required": false
+    },
+    "CREATOR_NAME": {
+      "description": "👤 Enter the Creator's Name (Optional)",
+      "value": "𝐍𝐈𝐑𝐕𝐀𝐍𝐀🖤",
+      "required": false
+    },
+    "CREATOR_CONTACT_ID_LINK": {
+      "description": "📞 Enter the Creator's Contact Link (Optional)",
+      "value": "https://t.me/AskKunalBot",
+      "required": false
+    },
+    "MONGO_URI": {
+      "description": "💾 Enter Your MongoDB Connection String (Optional)",
+      "value": "",
+      "required": false
+    }
+  },
+  "addons": [],
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    },
+    {
+      "url": "https://github.com/jonathanong/heroku-buildpack-ffmpeg-latest.git"
+    },
+    {
+      "url": "https://github.com/ytdl-org/youtube-dl.git"
+    },
+    {
+      "url": "https://github.com/heroku/heroku-buildpack-apt"
+    }
+  ]
+}
