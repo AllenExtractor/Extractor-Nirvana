@@ -11,7 +11,7 @@ from pyrogram.errors import PeerIdInvalid
 from Extractor import app
 import os
 
-log_channel = -1002546086874 # Get CHANNEL_ID from environment variable
+log_channel = -1003597599758 # Get CHANNEL_ID from environment variable
 
 def decrypt(enc):
     enc = b64decode(enc.split(':')[0])
