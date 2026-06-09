@@ -17,4 +17,4 @@ beautifulsoup4
 gunicorn
 apscheduler
 brotli
-dotenv
+python-dotenv
