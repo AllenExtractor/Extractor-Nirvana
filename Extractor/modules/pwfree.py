@@ -5,6 +5,7 @@ import aiohttp
 import logging
 import zipfile
 import time
+import calendar
 import requests
 from datetime import datetime, timedelta
 from pyrogram import filters
@@ -169,25 +170,92 @@ def find_pw_old_batch(batch_search):
 async def fetch_today_schedule(session: aiohttp.ClientSession, batch_id: str, target_date: str, headers: dict):
     """Fetch schedule for a specific date from PW API"""
     all_schedules = []
-    page = 1
-    while True:
-        url = f"https://api.penpencil.co/v2/batches/{batch_id}/schedules"
-        params = {
-            'page': page,
-            'startDate': target_date,
-            'endDate': target_date
-        }
-        data = await fetch_pwwp_data(session, url, headers=headers, params=params)
-        if data and data.get("success") and data.get("data"):
-            schedules = data["data"]
-            if not schedules:
+
+    # Convert YYYY-MM-DD to multiple formats PW API accepts
+    try:
+        dt = datetime.strptime(target_date, "%Y-%m-%d")
+        # Format 1: ISO 8601 with time (midnight UTC)
+        date_iso = dt.strftime("%Y-%m-%dT00:00:00.000Z")
+        # Format 2: epoch timestamp in milliseconds
+        date_epoch_ms = str(int(calendar.timegm(dt.timetuple())) * 1000)
+        # Format 3: original YYYY-MM-DD
+        date_plain = target_date
+    except ValueError:
+        date_iso = target_date
+        date_epoch_ms = target_date
+        date_plain = target_date
+
+    # Try multiple param combinations that PW API accepts
+    param_variants = [
+        {'page': 1, 'startDate': date_iso, 'endDate': date_iso},
+        {'page': 1, 'startDate': date_plain, 'endDate': date_plain},
+        {'page': 1, 'startDate': date_epoch_ms, 'endDate': date_epoch_ms},
+        {'page': 1, 'date': date_plain},
+        {'page': 1, 'date': date_iso},
+    ]
+
+    fetched = False
+    for base_params in param_variants:
+        page = 1
+        trial_schedules = []
+        while True:
+            params = dict(base_params)
+            params['page'] = page
+            url = f"https://api.penpencil.co/v2/batches/{batch_id}/schedules"
+            data = await fetch_pwwp_data(session, url, headers=headers, params=params)
+            if data and data.get("success") and data.get("data"):
+                schedules = data["data"]
+                if not schedules:
+                    break
+                for item in schedules:
+                    item['_page'] = page
+                    trial_schedules.append(item)
+                page += 1
+            else:
                 break
-            for item in schedules:
-                item['_page'] = page
-                all_schedules.append(item)
-            page += 1
-        else:
+
+        if trial_schedules:
+            # Filter results to only those matching target_date (API sometimes returns extra)
+            filtered = []
+            for item in trial_schedules:
+                item_date = item.get("date", "") or item.get("startTime", "") or item.get("scheduleDate", "")
+                # Accept item if date field contains target_date string, or if no date filtering possible
+                if target_date in str(item_date) or not item_date:
+                    filtered.append(item)
+            all_schedules = filtered if filtered else trial_schedules
+            fetched = True
+            logging.info(f"fetch_today_schedule: got {len(all_schedules)} items using params variant {base_params}")
             break
+
+    if not fetched:
+        # Last resort: fetch all schedules with broad range and filter client-side
+        logging.warning(f"fetch_today_schedule: all param variants returned empty, trying broad fetch")
+        try:
+            dt = datetime.strptime(target_date, "%Y-%m-%d")
+            # Fetch a week window around target date
+            start_dt = (dt - timedelta(days=3)).strftime("%Y-%m-%dT00:00:00.000Z")
+            end_dt = (dt + timedelta(days=3)).strftime("%Y-%m-%dT23:59:59.000Z")
+            page = 1
+            while True:
+                params = {'page': page, 'startDate': start_dt, 'endDate': end_dt}
+                url = f"https://api.penpencil.co/v2/batches/{batch_id}/schedules"
+                data = await fetch_pwwp_data(session, url, headers=headers, params=params)
+                if data and data.get("success") and data.get("data"):
+                    schedules = data["data"]
+                    if not schedules:
+                        break
+                    for item in schedules:
+                        item['_page'] = page
+                        # Filter by target date
+                        item_date = item.get("date", "") or item.get("startTime", "") or item.get("scheduleDate", "") or ""
+                        if target_date in str(item_date):
+                            all_schedules.append(item)
+                    page += 1
+                else:
+                    break
+        except Exception as e:
+            logging.error(f"fetch_today_schedule broad fallback error: {e}")
+
     return all_schedules
 
 async def fetch_schedule_details(session: aiohttp.ClientSession, batch_id: str, subject_id: str, schedule_id: str, headers: dict):
@@ -234,14 +302,34 @@ async def process_today_class(session: aiohttp.ClientSession, selected_batch_id:
     file_path_base = f"today_{target_date}_{clean_batch_name}"
 
     for schedule_item in schedules:
-        subject_id = schedule_item.get("subject", [""])[0] if isinstance(schedule_item.get("subject"), list) else schedule_item.get("subject", "")
-        schedule_id = schedule_item.get("_id", "")
-        topic = schedule_item.get("topic", "Unknown Topic").replace("/", "-").replace(":", "-")
-        start_time = schedule_item.get("startTime", "")
-        end_time = schedule_item.get("endTime", "")
-        content_type_tag = schedule_item.get("contentType", "unknown")
+        # Robust subject_id extraction - handle list, dict, or string
+        raw_subject = schedule_item.get("subject", "")
+        if isinstance(raw_subject, list):
+            subject_id = raw_subject[0] if raw_subject else ""
+            # Sometimes list contains dicts
+            if isinstance(subject_id, dict):
+                subject_id = subject_id.get("_id", "")
+        elif isinstance(raw_subject, dict):
+            subject_id = raw_subject.get("_id", "")
+        else:
+            subject_id = str(raw_subject) if raw_subject else ""
 
-        subject_name = subject_map.get(subject_id, {}).get("name", "Unknown Subject")
+        schedule_id = schedule_item.get("_id", "")
+        topic = schedule_item.get("topic", schedule_item.get("name", "Unknown Topic")).replace("/", "-").replace(":", "-")
+        start_time = schedule_item.get("startTime", schedule_item.get("startDate", ""))
+        end_time = schedule_item.get("endTime", schedule_item.get("endDate", ""))
+        content_type_tag = schedule_item.get("contentType", schedule_item.get("type", "unknown"))
+
+        # Try subject_map first, then fallback to schedule item's own subject name
+        subject_name = subject_map.get(subject_id, {}).get("name", "")
+        if not subject_name:
+            # Try to find subject name from schedule item directly
+            raw_sub_obj = schedule_item.get("subject", {})
+            if isinstance(raw_sub_obj, dict):
+                subject_name = raw_sub_obj.get("subject", raw_sub_obj.get("name", ""))
+            if not subject_name:
+                subject_name = schedule_item.get("subjectName", schedule_item.get("subjectSlug", "Unknown Subject"))
+            subject_name = subject_name.replace("/", "-") if subject_name else "Unknown Subject"
 
         if subject_name not in structured_data:
             structured_data[subject_name] = []
