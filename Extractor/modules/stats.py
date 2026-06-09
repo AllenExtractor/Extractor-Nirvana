@@ -10,11 +10,11 @@ from Extractor.core.mongo.usersdb import get_users, add_user, get_user
 from Extractor.core.mongo.plans_db import premium_users
 
 # Define ownerid at the module level
-ownerid = 7438818824  # Replace with your actual Telegram chat ID (integer)
+ownerid = 8909902924  # Replace with your actual Telegram chat ID (integer)
 
 # MongoDB database instance (same as implied in stats module)
 from motor.motor_asyncio import AsyncIOMotorClient
-MONGO_URI = ""  # Replace with your MongoDB URI
+MONGO_URI = "mongodb+srv://developerbro723_db_user:9axC7c7iQm0G3ESO@cluster0.dr8m75m.mongodb.net/?appName=Cluster0"  # Replace with your MongoDB URI
 client = AsyncIOMotorClient(MONGO_URI)
 db = client['king']  # Replace with your database name
 
