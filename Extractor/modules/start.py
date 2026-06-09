@@ -27,7 +27,7 @@ Welcome to the <b>Free Txt Extractor Bot</b> 📂
 <hr>
 
 <b>📌 Join our official channel:</b><br>
-👉 <a href="https://t.me/+5T4l-2VPfDo3Mjhl">Join Now</a>
+👉 <a href="https://t.me/TeamCinderella">Join Now</a>
 <hr>
 
 <b>🛠 Available Bot Commands:</b><br>
@@ -61,8 +61,8 @@ html        - for site (utkarsh only )
 start_buttons = InlineKeyboardMarkup(
     [
         [
-            InlineKeyboardButton("Join Now", url="https://t.me/+CLOrDhSK-ig1ODg1"),
-            InlineKeyboardButton("Supports", url="https://t.me/king_rajasthan_23_bot")
+            InlineKeyboardButton("Join Now", url="https://t.me/Toxic_Official_1"),
+            InlineKeyboardButton("Contact", url="https://t.me/SmartBoy_ApnaMS")
         ]
     ]
 )
