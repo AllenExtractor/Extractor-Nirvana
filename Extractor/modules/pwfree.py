@@ -28,8 +28,17 @@ async def fetch_pwwp_data(session: aiohttp.ClientSession, url: str, headers: dic
     for attempt in range(max_retries):
         try:
             async with session.request(method, url, headers=headers, params=params, json=data) as response:
+                # 404 means endpoint doesn't exist — no point retrying
+                if response.status == 404:
+                    logging.warning(f"404 Not Found: {url} — skipping retries")
+                    return None
                 response.raise_for_status()
                 return await response.json()
+        except aiohttp.ClientResponseError as e:
+            if e.status == 404:
+                logging.warning(f"404 Not Found: {url} — skipping retries")
+                return None
+            logging.error(f"Attempt {attempt + 1} failed: aiohttp error fetching {url}: {e}")
         except aiohttp.ClientError as e:
             logging.error(f"Attempt {attempt + 1} failed: aiohttp error fetching {url}: {e}")
         except Exception as e:
@@ -168,94 +177,140 @@ def find_pw_old_batch(batch_search):
     return matching_batches
 
 async def fetch_today_schedule(session: aiohttp.ClientSession, batch_id: str, target_date: str, headers: dict):
-    """Fetch schedule for a specific date from PW API"""
+    """Fetch schedule for a specific date from PW API using correct endpoints"""
     all_schedules = []
 
-    # Convert YYYY-MM-DD to multiple formats PW API accepts
+    # Parse target date
     try:
         dt = datetime.strptime(target_date, "%Y-%m-%d")
-        # Format 1: ISO 8601 with time (midnight UTC)
-        date_iso = dt.strftime("%Y-%m-%dT00:00:00.000Z")
-        # Format 2: epoch timestamp in milliseconds
-        date_epoch_ms = str(int(calendar.timegm(dt.timetuple())) * 1000)
-        # Format 3: original YYYY-MM-DD
-        date_plain = target_date
+        # PW API uses epoch milliseconds for date filtering
+        epoch_ms = int(calendar.timegm(dt.timetuple())) * 1000
+        # Next day epoch for range
+        next_dt = dt + timedelta(days=1)
+        epoch_ms_end = int(calendar.timegm(next_dt.timetuple())) * 1000
     except ValueError:
-        date_iso = target_date
-        date_epoch_ms = target_date
-        date_plain = target_date
+        logging.error(f"Invalid date format: {target_date}")
+        return []
 
-    # Try multiple param combinations that PW API accepts
-    param_variants = [
-        {'page': 1, 'startDate': date_iso, 'endDate': date_iso},
-        {'page': 1, 'startDate': date_plain, 'endDate': date_plain},
-        {'page': 1, 'startDate': date_epoch_ms, 'endDate': date_epoch_ms},
-        {'page': 1, 'date': date_plain},
-        {'page': 1, 'date': date_iso},
+    # PW actual working endpoints for batch content/schedule - try in order
+    endpoint_variants = [
+        # v3 batch content endpoint (most common working one)
+        {
+            "url": f"https://api.penpencil.co/v3/batches/{batch_id}/batch-contents",
+            "params_list": [
+                {"page": 1, "startDate": epoch_ms, "endDate": epoch_ms_end},
+                {"page": 1, "startDate": target_date, "endDate": target_date},
+            ]
+        },
+        # v2 batch content endpoint
+        {
+            "url": f"https://api.penpencil.co/v2/batches/{batch_id}/batch-contents",
+            "params_list": [
+                {"page": 1, "startDate": epoch_ms, "endDate": epoch_ms_end},
+                {"page": 1, "startDate": target_date, "endDate": target_date},
+            ]
+        },
+        # v3 contents endpoint
+        {
+            "url": f"https://api.penpencil.co/v3/batches/{batch_id}/contents",
+            "params_list": [
+                {"page": 1, "startDate": epoch_ms, "endDate": epoch_ms_end},
+                {"page": 1, "date": target_date},
+            ]
+        },
+        # v2 contents endpoint
+        {
+            "url": f"https://api.penpencil.co/v2/batches/{batch_id}/contents",
+            "params_list": [
+                {"page": 1, "startDate": epoch_ms, "endDate": epoch_ms_end},
+                {"page": 1, "startDate": target_date, "endDate": target_date},
+            ]
+        },
     ]
 
-    fetched = False
-    for base_params in param_variants:
-        page = 1
-        trial_schedules = []
-        while True:
-            params = dict(base_params)
-            params['page'] = page
-            url = f"https://api.penpencil.co/v2/batches/{batch_id}/schedules"
-            data = await fetch_pwwp_data(session, url, headers=headers, params=params)
-            if data and data.get("success") and data.get("data"):
-                schedules = data["data"]
-                if not schedules:
-                    break
-                for item in schedules:
-                    item['_page'] = page
-                    trial_schedules.append(item)
-                page += 1
-            else:
-                break
-
-        if trial_schedules:
-            # Filter results to only those matching target_date (API sometimes returns extra)
-            filtered = []
-            for item in trial_schedules:
-                item_date = item.get("date", "") or item.get("startTime", "") or item.get("scheduleDate", "")
-                # Accept item if date field contains target_date string, or if no date filtering possible
-                if target_date in str(item_date) or not item_date:
-                    filtered.append(item)
-            all_schedules = filtered if filtered else trial_schedules
-            fetched = True
-            logging.info(f"fetch_today_schedule: got {len(all_schedules)} items using params variant {base_params}")
-            break
-
-    if not fetched:
-        # Last resort: fetch all schedules with broad range and filter client-side
-        logging.warning(f"fetch_today_schedule: all param variants returned empty, trying broad fetch")
-        try:
-            dt = datetime.strptime(target_date, "%Y-%m-%d")
-            # Fetch a week window around target date
-            start_dt = (dt - timedelta(days=3)).strftime("%Y-%m-%dT00:00:00.000Z")
-            end_dt = (dt + timedelta(days=3)).strftime("%Y-%m-%dT23:59:59.000Z")
+    for endpoint in endpoint_variants:
+        url = endpoint["url"]
+        for base_params in endpoint["params_list"]:
             page = 1
+            trial_schedules = []
+            success = False
             while True:
-                params = {'page': page, 'startDate': start_dt, 'endDate': end_dt}
-                url = f"https://api.penpencil.co/v2/batches/{batch_id}/schedules"
+                params = dict(base_params)
+                params["page"] = page
                 data = await fetch_pwwp_data(session, url, headers=headers, params=params)
-                if data and data.get("success") and data.get("data"):
+                if data is None:
+                    # 404 or error - this endpoint doesn't exist, skip all its param variants
+                    break
+                if data.get("success") and data.get("data"):
                     schedules = data["data"]
                     if not schedules:
                         break
                     for item in schedules:
-                        item['_page'] = page
-                        # Filter by target date
-                        item_date = item.get("date", "") or item.get("startTime", "") or item.get("scheduleDate", "") or ""
-                        if target_date in str(item_date):
-                            all_schedules.append(item)
+                        item["_page"] = page
+                        trial_schedules.append(item)
+                    success = True
                     page += 1
                 else:
                     break
-        except Exception as e:
-            logging.error(f"fetch_today_schedule broad fallback error: {e}")
 
+            if trial_schedules:
+                # Filter to only items matching target_date if date field present
+                filtered = []
+                for item in trial_schedules:
+                    item_date_raw = (
+                        item.get("date") or
+                        item.get("startTime") or
+                        item.get("scheduleDate") or
+                        item.get("createdAt") or
+                        ""
+                    )
+                    item_date_str = str(item_date_raw)
+                    if target_date in item_date_str or not item_date_raw:
+                        filtered.append(item)
+                all_schedules = filtered if filtered else trial_schedules
+                logging.info(f"fetch_today_schedule: success via {url} | got {len(all_schedules)} items")
+                return all_schedules
+            elif success:
+                # Endpoint worked but returned empty - no classes this date
+                logging.info(f"fetch_today_schedule: {url} returned empty for {target_date}")
+                return []
+
+    # All REST endpoints failed — fallback: iterate all subjects and fetch contents per subject
+    logging.warning(f"fetch_today_schedule: all direct endpoints failed, using subject-content fallback")
+    try:
+        batch_url = f"https://api.penpencil.co/v3/batches/{batch_id}/details"
+        batch_details = await fetch_pwwp_data(session, batch_url, headers=headers)
+        if batch_details and batch_details.get("success"):
+            subjects = batch_details.get("data", {}).get("subjects", [])
+            for subj in subjects:
+                subj_id = subj.get("_id")
+                for content_type in ["videos", "notes", "DppVideos", "DppNotes"]:
+                    page = 1
+                    while True:
+                        url = f"https://api.penpencil.co/v2/batches/{batch_id}/subject/{subj_id}/contents"
+                        params = {
+                            "contentType": content_type,
+                            "page": page,
+                            "startDate": epoch_ms,
+                            "endDate": epoch_ms_end,
+                        }
+                        data = await fetch_pwwp_data(session, url, headers=headers, params=params)
+                        if data and data.get("success") and data.get("data"):
+                            items = data["data"]
+                            if not items:
+                                break
+                            for item in items:
+                                item["_subject_id"] = subj_id
+                                item["_content_type"] = content_type
+                                item["_page"] = page
+                                all_schedules.append(item)
+                            page += 1
+                        else:
+                            break
+    except Exception as e:
+        logging.error(f"fetch_today_schedule subject-fallback error: {e}")
+
+    logging.info(f"fetch_today_schedule fallback: got {len(all_schedules)} items")
     return all_schedules
 
 async def fetch_schedule_details(session: aiohttp.ClientSession, batch_id: str, subject_id: str, schedule_id: str, headers: dict):
@@ -302,34 +357,34 @@ async def process_today_class(session: aiohttp.ClientSession, selected_batch_id:
     file_path_base = f"today_{target_date}_{clean_batch_name}"
 
     for schedule_item in schedules:
-        # Robust subject_id extraction - handle list, dict, or string
+        # Robust subject_id extraction
         raw_subject = schedule_item.get("subject", "")
         if isinstance(raw_subject, list):
-            subject_id = raw_subject[0] if raw_subject else ""
-            # Sometimes list contains dicts
-            if isinstance(subject_id, dict):
-                subject_id = subject_id.get("_id", "")
+            first = raw_subject[0] if raw_subject else ""
+            subject_id = first.get("_id", "") if isinstance(first, dict) else str(first)
         elif isinstance(raw_subject, dict):
             subject_id = raw_subject.get("_id", "")
         else:
             subject_id = str(raw_subject) if raw_subject else ""
+        # Fallback: subject-content path sets _subject_id directly
+        if not subject_id:
+            subject_id = schedule_item.get("_subject_id", "")
 
         schedule_id = schedule_item.get("_id", "")
         topic = schedule_item.get("topic", schedule_item.get("name", "Unknown Topic")).replace("/", "-").replace(":", "-")
         start_time = schedule_item.get("startTime", schedule_item.get("startDate", ""))
         end_time = schedule_item.get("endTime", schedule_item.get("endDate", ""))
-        content_type_tag = schedule_item.get("contentType", schedule_item.get("type", "unknown"))
+        content_type_tag = schedule_item.get("contentType", schedule_item.get("_content_type", schedule_item.get("type", "unknown")))
 
-        # Try subject_map first, then fallback to schedule item's own subject name
+        # Subject name from map or from schedule item itself
         subject_name = subject_map.get(subject_id, {}).get("name", "")
         if not subject_name:
-            # Try to find subject name from schedule item directly
-            raw_sub_obj = schedule_item.get("subject", {})
-            if isinstance(raw_sub_obj, dict):
-                subject_name = raw_sub_obj.get("subject", raw_sub_obj.get("name", ""))
+            raw_sub = schedule_item.get("subject", {})
+            if isinstance(raw_sub, dict):
+                subject_name = raw_sub.get("subject", raw_sub.get("name", ""))
             if not subject_name:
-                subject_name = schedule_item.get("subjectName", schedule_item.get("subjectSlug", "Unknown Subject"))
-            subject_name = subject_name.replace("/", "-") if subject_name else "Unknown Subject"
+                subject_name = schedule_item.get("subjectName", "Unknown Subject")
+            subject_name = subject_name.replace("/", "-") or "Unknown Subject"
 
         if subject_name not in structured_data:
             structured_data[subject_name] = []
