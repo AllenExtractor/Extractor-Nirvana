@@ -65,7 +65,7 @@ async def fetch_pwwp_data(session: aiohttp.ClientSession, url: str, headers: dic
             return None
 
 async def process_pwwp_chapter_content(session: aiohttp.ClientSession, chapter_id, selected_batch_id, subject_id, schedule_id, content_type, headers: dict):
-    url = f"https://api.penpencil.co/v1/batches/{selected_batch_id}/subject/{subject_id}/schedule/{schedule_id}/schedule-details"
+    url = f"https://api.penpencil.co/v2/batches/{selected_batch_id}/subject/{subject_id}/schedule/{schedule_id}/schedule-details"
     data = await fetch_pwwp_data(session, url, headers=headers)
     content = []
     if data and data.get("success") and data.get("data"):
@@ -206,16 +206,16 @@ async def fetch_today_schedule(session: aiohttp.ClientSession, batch_id: str, ta
 
     # PW real working endpoints tried in order
     endpoint_variants = [
-        (f"https://api.penpencil.co/v3/batches/{batch_id}/batch-contents",
-            [{"page": 1, "startDate": epoch_ms, "endDate": epoch_ms_end},
-             {"page": 1, "startDate": target_date, "endDate": target_date}]),
         (f"https://api.penpencil.co/v2/batches/{batch_id}/batch-contents",
             [{"page": 1, "startDate": epoch_ms, "endDate": epoch_ms_end},
              {"page": 1, "startDate": target_date, "endDate": target_date}]),
-        (f"https://api.penpencil.co/v3/batches/{batch_id}/contents",
+        (f"https://api.penpencil.co/v3/batches/{batch_id}/batch-contents",
+            [{"page": 1, "startDate": epoch_ms, "endDate": epoch_ms_end},
+             {"page": 1, "startDate": target_date, "endDate": target_date}]),
+        (f"https://api.penpencil.co/v4/batches/{batch_id}/contents",
             [{"page": 1, "startDate": epoch_ms, "endDate": epoch_ms_end},
              {"page": 1, "date": target_date}]),
-        (f"https://api.penpencil.co/v2/batches/{batch_id}/contents",
+        (f"https://api.penpencil.co/v1/batches/{batch_id}/contents",
             [{"page": 1, "startDate": epoch_ms, "endDate": epoch_ms_end},
              {"page": 1, "startDate": target_date, "endDate": target_date}]),
     ]
@@ -265,7 +265,7 @@ async def fetch_today_schedule(session: aiohttp.ClientSession, batch_id: str, ta
     logging.warning("fetch_today_schedule: all endpoints failed, trying subject-content fallback")
     try:
         bd = await fetch_pwwp_data(
-            session, f"https://api.penpencil.co/v3/batches/{batch_id}/details", headers=headers
+            session, f"https://api.penpencil.co/v2/batches/{batch_id}/details", headers=headers
         )
         if bd and bd.get("success"):
             for subj in bd.get("data", {}).get("subjects", []):
@@ -297,7 +297,7 @@ async def fetch_today_schedule(session: aiohttp.ClientSession, batch_id: str, ta
 async def fetch_schedule_details(session: aiohttp.ClientSession, batch_id: str, subject_id: str, schedule_id: str, headers: dict):
     """Fetch detailed content for a schedule item — rate-limited via semaphore"""
     async with _schedule_detail_semaphore:
-        url = f"https://api.penpencil.co/v1/batches/{batch_id}/subject/{subject_id}/schedule/{schedule_id}/schedule-details"
+        url = f"https://api.penpencil.co/v2/batches/{batch_id}/subject/{subject_id}/schedule/{schedule_id}/schedule-details"
         result = await fetch_pwwp_data(session, url, headers=headers)
         # Small delay after each request to avoid burst 429
         await asyncio.sleep(0.4)
@@ -308,7 +308,7 @@ async def process_today_class(session: aiohttp.ClientSession, selected_batch_id:
     logging.info(f"Fetching schedule for date: {target_date}")
 
     # Get batch details to find subjects
-    url = f"https://api.penpencil.co/v3/batches/{selected_batch_id}/details"
+    url = f"https://api.penpencil.co/v2/batches/{selected_batch_id}/details"
     batch_details = await fetch_pwwp_data(session, url, headers=headers)
 
     if not batch_details or not batch_details.get("success"):
@@ -730,7 +730,7 @@ async def login(app, user_id, m, all_urls, start_time, bname, batch_id, app_name
         f"Expiry Date:-**{expiry_display}\n **Extracted BY:{credit}"
         f"Total Pdf - {pdf_count} {class_info}\n\n"
         f"**╾───• Txt Extractor •───╼** \n"
-        f" UPLOADER IN CHEAP PRICE - @king_rajasthan_23_bot \n"
+        f" WAllah Wallah Habibi - @SmartBoy_ApnaMS \n"
         f"Time Taken: {formatted_time}"
     )
 
@@ -789,7 +789,7 @@ async def process_pwwp(app, m, user_id, bot_link):
                     "organizationId": "5eb393ee95fab7468a79d189"
                 }
                 try:
-                    async with session.post("https://api.penpencil.co/v1/users/get-otp?smsType=0", json=data, headers=headers) as response:
+                    async with session.post("https://api.penpencil.co/v2/users/get-otp?smsType=0", json=data, headers=headers) as response:
                         await response.read()
                 except Exception as e:
                     await editable.edit(f"**Error : {e}**")
@@ -813,7 +813,7 @@ async def process_pwwp(app, m, user_id, bot_link):
                     "longitude": 0
                 }
                 try:
-                    async with session.post("https://api.penpencil.co/v3/oauth/token", json=payload, headers=headers) as response:
+                    async with session.post("https://api.penpencil.co/v2/oauth/token", json=payload, headers=headers) as response:
                         access_token = (await response.json())["data"]["access_token"]
                         await editable.edit(f"<b>Physics Wallah Login Successful ✅</b>\n\n<pre language='Save this Login Token for future usage'>{access_token}</pre>\n\n")
                         editable = await m.reply_text("**Getting Batches In Your I'd**")
@@ -828,7 +828,7 @@ async def process_pwwp(app, m, user_id, bot_link):
                 'page': '1',
             }
             try:
-                async with session.get("https://api.penpencil.co/v3/batches/all-purchased-batches", headers=headers, params=params) as response:
+                async with session.get("https://api.penpencil.co/v2/batches/all-purchased-batches", headers=headers, params=params) as response:
                     response.raise_for_status()
                     batches = (await response.json()).get("data", [])
             except Exception as e:
@@ -842,7 +842,7 @@ async def process_pwwp(app, m, user_id, bot_link):
             except:
                 await editable.edit("**Timeout! You took too long to respond**")
                 return
-            url = f"https://api.penpencil.co/v3/batches/search?name={batch_search}"
+            url = f"https://api.penpencil.co/v2/batches/search?name={batch_search}"
             courses = await fetch_pwwp_data(session, url, headers)
             courses = courses.get("data", {}) if courses else {}
             if courses:
@@ -910,7 +910,7 @@ async def process_pwwp(app, m, user_id, bot_link):
                     return
 
                 # Fetch batch details for expiry date
-                url = f"https://api.penpencil.co/v3/batches/{selected_batch_id}/details"
+                url = f"https://api.penpencil.co/v2/batches/{selected_batch_id}/details"
                 batch_details = await fetch_pwwp_data(session, url, headers=headers)
 
                 expiry_date = None
